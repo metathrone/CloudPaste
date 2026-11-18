@@ -65,7 +65,7 @@ jobs:
       - name: ⚙️ 配置 Node.js 环境
         uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: "22"
 
       # ==================== 步骤 1：构建前端 ====================
       - name: 📦 构建前端静态资源
@@ -108,30 +108,12 @@ jobs:
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: |
           echo "检查 D1 数据库 cloudpaste-db..."
-          DATABASE_LIST=$(npx wrangler d1 list --json 2>/dev/null || echo "[]")
-          EXISTING_DB=$(echo "$DATABASE_LIST" | jq -r '.[] | select(.name=="cloudpaste-db") | .uuid')
-
-          if [ -n "$EXISTING_DB" ]; then
-            echo "✅ 找到已有 D1 数据库: $EXISTING_DB"
-            DATABASE_ID=$EXISTING_DB
-          else
-            echo "创建新的 D1 数据库 cloudpaste-db..."
-            CREATE_OUTPUT=$(npx wrangler d1 create cloudpaste-db 2>&1)
-            DATABASE_ID=$(echo "$CREATE_OUTPUT" | grep -oP "database_id = \"\K[^\"]+")
-            if [ -z "$DATABASE_ID" ]; then
-              DATABASE_ID=$(echo "$CREATE_OUTPUT" | grep -oP "([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})")
-            fi
-            if [ -z "$DATABASE_ID" ]; then
-              LIST_OUTPUT=$(npx wrangler d1 list --json 2>/dev/null || echo "[]")
-              DATABASE_ID=$(echo "$LIST_OUTPUT" | jq -r '.[] | select(.name=="cloudpaste-db") | .uuid')
-            fi
-            echo "✅ 数据库创建成功: $DATABASE_ID"
+          DATABASE_ID="96352b48-df1e-4972-8a95-0a042ec81bcc"
+          CONFIG_ID=$(grep -oE 'database_id = "[^"]+"' wrangler.spa.toml | cut -d'"' -f2 || true)
+          if [ -n "$CONFIG_ID" ]; then
+            DATABASE_ID="$CONFIG_ID"
           fi
-
-          if [ -z "$DATABASE_ID" ]; then
-            echo "❌ 未能获取到 D1 数据库 ID，请检查 API Token 权限是否包含 D1:Edit"
-            exit 1
-          fi
+          echo "✅ 使用 D1 数据库 ID: $DATABASE_ID"
 
           # 替换 wrangler.spa.toml 中的 database_id
           sed -i -E "s/(database_id = \")[^\"]+(\"\s*$)/\1$DATABASE_ID\2/" wrangler.spa.toml
