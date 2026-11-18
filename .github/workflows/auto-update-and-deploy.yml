@@ -1,0 +1,158 @@
+name: Auto Sync & Deploy to Cloudflare Workers
+
+on:
+  schedule:
+    - cron: '0 4 * * *'  # 每天 UTC 04:00 (北京时间 12:00) 自动检查上游更新
+  workflow_dispatch:     # 支持手动一键触发更新与部署
+  push:
+    branches:
+      - main
+    paths:
+      - 'frontend/**'
+      - 'backend/**'
+      - '.github/workflows/auto-update-and-deploy.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  sync-and-deploy:
+    name: Sync Upstream & Deploy SPA
+    runs-on: ubuntu-latest
+    steps:
+      - name: 📥 检出代码
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 🔄 同步上游代码 (Sync Upstream)
+        id: sync
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/ling-drag0n/CloudPaste.git 2>/dev/null || true
+          git fetch upstream main
+
+          # 备份我们的自定义配置
+          cp backend/wrangler.spa.toml /tmp/wrangler.spa.toml.custom
+
+          # 检查上游是否有新提交
+          UPSTREAM_DIFF=$(git rev-list HEAD..upstream/main --count)
+          echo "上游领先提交数: $UPSTREAM_DIFF"
+
+          if [ "$UPSTREAM_DIFF" -gt 0 ]; then
+            echo "发现上游更新，正在合并..."
+            git merge upstream/main --no-edit || {
+              echo "检测到合并冲突，保留自定义配置..."
+              git checkout --ours backend/wrangler.spa.toml .github/workflows/ || true
+              git add -A
+              git commit -m "chore: 解决上游合并冲突" || true
+            }
+
+            # 确保自定义域名配置不丢失
+            if ! grep -q "paste.rushia.eu.org" backend/wrangler.spa.toml; then
+              echo "恢复自定义域名配置..."
+              cp /tmp/wrangler.spa.toml.custom backend/wrangler.spa.toml
+            fi
+
+            git add backend/wrangler.spa.toml
+            git commit -m "chore: 同步上游更新并保留自定义域名配置 [skip ci]" || true
+            git push origin main
+          else
+            echo "当前代码已是最新，无需合并。"
+          fi
+
+      - name: ⚙️ 配置 Node.js 环境
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      # ==================== 步骤 1：构建前端 ====================
+      - name: 📦 构建前端静态资源
+        working-directory: ./frontend
+        run: |
+          echo "安装前端依赖..."
+          npm ci
+          echo "构建前端 SPA 静态文件..."
+          npm run build
+        env:
+          VITE_APP_ENV: production
+          VITE_ENABLE_DEVTOOLS: false
+
+      - name: 🔍 验证前端构建结果
+        run: |
+          if [ ! -f "frontend/dist/index.html" ]; then
+            echo "❌ 前端构建失败：未找到 frontend/dist/index.html"
+            exit 1
+          fi
+          echo "✅ 前端构建完成，产物大小："
+          du -sh frontend/dist
+
+      # ==================== 步骤 2：准备后端 ====================
+      - name: 📦 安装后端依赖
+        working-directory: ./backend
+        run: |
+          if npm ci --no-optional; then
+            echo "✅ npm ci 成功"
+          else
+            echo "⚠️ npm ci 回退到 npm install"
+            npm install --no-optional
+          fi
+          npx wrangler telemetry disable
+
+      # ==================== 步骤 3：D1 数据库与自定义域名检查 ====================
+      - name: 🗄️ 检查并初始化 D1 数据库
+        working-directory: ./backend
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          echo "检查 D1 数据库 cloudpaste-db..."
+          DATABASE_LIST=$(npx wrangler d1 list --json 2>/dev/null || echo "[]")
+          EXISTING_DB=$(echo "$DATABASE_LIST" | jq -r '.[] | select(.name=="cloudpaste-db") | .uuid')
+
+          if [ -n "$EXISTING_DB" ]; then
+            echo "✅ 找到已有 D1 数据库: $EXISTING_DB"
+            DATABASE_ID=$EXISTING_DB
+          else
+            echo "创建新的 D1 数据库 cloudpaste-db..."
+            CREATE_OUTPUT=$(npx wrangler d1 create cloudpaste-db 2>&1)
+            DATABASE_ID=$(echo "$CREATE_OUTPUT" | grep -oP "database_id = \"\K[^\"]+")
+            if [ -z "$DATABASE_ID" ]; then
+              DATABASE_ID=$(echo "$CREATE_OUTPUT" | grep -oP "([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})")
+            fi
+            if [ -z "$DATABASE_ID" ]; then
+              LIST_OUTPUT=$(npx wrangler d1 list --json 2>/dev/null || echo "[]")
+              DATABASE_ID=$(echo "$LIST_OUTPUT" | jq -r '.[] | select(.name=="cloudpaste-db") | .uuid')
+            fi
+            echo "✅ 数据库创建成功: $DATABASE_ID"
+          fi
+
+          if [ -z "$DATABASE_ID" ]; then
+            echo "❌ 未能获取到 D1 数据库 ID，请检查 API Token 权限是否包含 D1:Edit"
+            exit 1
+          fi
+
+          # 替换 wrangler.spa.toml 中的 database_id
+          sed -i -E "s/(database_id = \")[^\"]+(\"\s*$)/\1$DATABASE_ID\2/" wrangler.spa.toml
+
+          # 执行数据表结构初始化
+          echo "执行表结构初始化..."
+          npx wrangler d1 execute cloudpaste-db --remote --file=./schema.sql || echo "⚠️ 表结构可能已初始化，继续部署"
+
+      # ==================== 步骤 4：部署到 Cloudflare Workers ====================
+      - name: 🚀 部署 SPA Worker
+        working-directory: ./backend
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          echo "部署 Worker 及静态资源..."
+          npx wrangler deploy --config wrangler.spa.toml
+
+      - name: 🎉 部署完成提示
+        run: |
+          echo "===================================================="
+          echo "🎉 CloudPaste SPA 已成功部署到 Cloudflare Workers!"
+          echo "🌐 自定义域名: https://paste.rushia.eu.org"
+          echo "===================================================="
