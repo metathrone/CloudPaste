@@ -104,7 +104,7 @@ jobs:
           echo "检查 Cloudflare Pages 项目是否存在..."
           PROJECT_CHECK=$(curl -s -X GET "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/pages/projects" \
             -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
-            -H "Content-Type: application/json" | jq -r '.result[] | select(.name=="cloudpaste-frontend") | .name')
+            -H "Content-Type: application/json" | jq -r '.result // [] | .[]? | select(.name=="cloudpaste-frontend") | .name')
 
           if [ -n "$PROJECT_CHECK" ]; then
             echo "✅ 找到现有Pages项目: cloudpaste-frontend"
